@@ -1,11 +1,12 @@
 """
-Evolutionary Control of Molecular "Super-Rotors"
-Physics Engine: Rigid Rotor in a Non-Resonant Laser Field (N2 Molecule)
-Optimization: Genetic Algorithm (Closed-Loop Feedback)
-
-Author: Research Group [Your Name]
+Scientifically Accurate Evolutionary Control of N2 Super-Rotors
+Author: Research Group
 Date: October 2023
-Units: Atomic Units (hbar = 1)
+
+Physics:
+- Molecule: 14N2 (Linear Rigid Rotor + Centrifugal Distortion)
+- Interaction: Non-resonant AC Stark Effect
+- Units: Internal = Atomic Units (a.u.), Input/Output = SI/Spectroscopic
 """
 
 import numpy as np
@@ -13,260 +14,257 @@ import matplotlib.pyplot as plt
 from scipy.integrate import odeint
 
 # ==============================================================================
-# SECTION 1: PHYSICAL CONSTANTS & SYSTEM CONFIGURATION
+# 1. SPECTROSCOPIC CONSTANTS & UNIT CONVERSIONS
 # ==============================================================================
 
-# Simulation Parameters
-HBAR = 1.0                # Normalized Planck constant
-B_CONST = 1.0             # Rotational constant B for N2 (Normalized)
-DELTA_ALPHA = 50.0        # Polarizability anisotropy (Interaction strength)
-J_MAX = 20                # Basis set truncation (J = 0, 2, ... 2*J_MAX)
-TIME_MAX = 15.0           # Simulation duration (a.u.)
-STEPS = 1000              # Time resolution
+# Atomic Unit Conversions
+AU_TO_CM = 219474.63       # 1 Hartree in cm^-1
+AU_TO_FS = 0.0241888       # 1 a.u. time in femtoseconds
+AU_TO_PS = 0.0000241888    # 1 a.u. time in picoseconds
+AU_TO_TW_CM2 = 3.509e4     # 1 a.u. intensity in TW/cm^2
+
+# Nitrogen (14N2) Parameters [Huber & Herzberg]
+B0_CM = 1.989581           # Rotational constant (cm^-1)
+D0_CM = 5.76e-6            # Centrifugal distortion (cm^-1)
+DELTA_ALPHA_AU = 6.7       # Polarizability anisotropy (a.u.) ~ 1.0 A^3
+
+# Convert to Atomic Units for Calculation
+B0 = B0_CM / AU_TO_CM
+D0 = D0_CM / AU_TO_CM
+
+# Simulation Grid
+J_MAX = 50                 # Basis size (High enough for T ~ 300K or Super-Rotors)
+REVIVAL_TIME_AU = np.pi / B0
+REVIVAL_TIME_PS = REVIVAL_TIME_AU * AU_TO_PS  # Approx 8.3 ps
+
+print(f"--- SIMULATION PARAMETERS (14N2) ---")
+print(f"Rotational Constant B0: {B0:.2e} a.u. ({B0_CM} cm^-1)")
+print(f"Revival Time: {REVIVAL_TIME_PS:.2f} ps")
+print(f"Basis Truncation: J_max = {J_MAX}")
 
 # ==============================================================================
-# SECTION 2: THE QUANTUM PHYSICS ENGINE (VIRTUAL LAB)
+# 2. QUANTUM DYNAMICS ENGINE
 # ==============================================================================
 
-def build_hamiltonian_infrastructure(j_max):
+def build_hamiltonian_infrastructure():
     """
-    Constructs the time-independent components of the Hamiltonian.
-    Returns:
-        H_rot (Diagonal Matrix): Kinetic energy operator B*J*(J+1)
-        H_int_coupling (Sparse Matrix): Coupling matrix <J|cos^2(theta)|J'>
-        J_vals (Array): Array of rotational quantum numbers
+    Constructs static Hamiltonian matrices.
+    Selection Rules: Delta J = 0, +/- 2
     """
-    # N2 is a homonuclear diatomic, so we consider only even J states (nuclear spin stats)
-    # Selection rules for linear polarization: Delta J = 0, +/- 2
-    j_vals = np.arange(0, 2 * j_max, 2)
+    # Even J states only for 14N2 (Nuclear Spin I=1, Sigma_g+)
+    # Technically odd J exist with different weights, but for alignment
+    # starting from J=0, we stay in the even parity manifold.
+    j_vals = np.arange(0, 2 * J_MAX, 2)
     n_states = len(j_vals)
 
-    # 1. Kinetic Energy (Field-Free Hamiltonian)
-    # E_J = B * J * (J + 1)
-    rot_energies = B_CONST * j_vals * (j_vals + 1)
-    h_rot = np.diag(rot_energies)
+    # 1. Field-Free Hamiltonian (Diagonal)
+    # H_0 = B*J(J+1) - D*[J(J+1)]^2
+    j_sq_term = j_vals * (j_vals + 1)
+    energies = B0 * j_sq_term - D0 * (j_sq_term**2)
+    h_rot = np.diag(energies)
 
-    # 2. Interaction Coupling Matrix Elements <J|cos^2(theta)|J'>
-    # Diagonal Elements <J|cos^2|J>
-    # Formula: (2J^2 + 2J - 1) / ((2J - 1)(2J + 3))
-    diag_elems = (2*j_vals**2 + 2*j_vals - 1) / ((2*j_vals - 1) * (2*j_vals + 3))
+    # 2. Interaction Coupling <J|cos^2|J'>
+    # Diagonal
+    diag = (2*j_vals**2 + 2*j_vals - 1) / ((2*j_vals - 1) * (2*j_vals + 3))
 
-    # Off-Diagonal Elements <J|cos^2|J+2>
-    off_diag_elems = np.zeros(n_states - 1)
+    # Off-Diagonal
+    off_diag = np.zeros(n_states - 1)
     for i in range(n_states - 1):
         J = j_vals[i]
-        # Clebsch-Gordan derived coupling strength
         val = np.sqrt(((J+1)*(J+2)) / ((2*J+1)*(2*J+3))) * \
               np.sqrt(((J+1)*(J+2)) / ((2*J+3)*(2*J+5)))
-        off_diag_elems[i] = val
+        off_diag[i] = val
 
-    # Assemble Tridiagonal Matrix
-    h_coupling = np.diag(diag_elems) + \
-                 np.diag(off_diag_elems, k=1) + \
-                 np.diag(off_diag_elems, k=-1)
+    h_coupling = np.diag(diag) + np.diag(off_diag, k=1) + np.diag(off_diag, k=-1)
 
-    return h_rot, h_coupling, j_vals, rot_energies
+    return h_rot, h_coupling, j_vals, energies
 
-# Initialize System (Global Scope for Speed in ODE Solver)
-H_ROT, COUPLING_MAT, J_VALUES, ROT_ENERGIES = build_hamiltonian_infrastructure(J_MAX)
+# Initialize System
+H_ROT, COUPLING_MAT, J_VALS, E_LEVELS = build_hamiltonian_infrastructure()
 
-def tdse_derivative(state_flat, t, amp, width, t0):
+def tdse_derivative(state_flat, t, E0, tau, t_center):
     """
-    Computes the time derivative of the wavefunction for the ODE solver.
-    d|Psi>/dt = -i/hbar * H(t) * |Psi>
+    Schrodinger Equation: i dPsi/dt = [H0 - 1/4 * DeltaAlpha * E(t)^2 * cos^2] Psi
     """
-    # 1. Unpack State (Real -> Complex)
+    # Unpack
     n = len(state_flat) // 2
     psi = state_flat[:n] + 1j * state_flat[n:]
 
-    # 2. Define Laser Field (Gaussian Envelope)
-    # E(t)^2 ~ I(t)
-    envelope = np.exp(-((t - t0)**2) / (2 * width**2))
-    field_intensity = (amp * envelope)**2
+    # Laser Field Envelope (Gaussian)
+    # E(t) = E0 * exp(-2 ln2 * (t-tc)^2 / tau^2)  <-- FWHM definition
+    # We use simple sigma definition for code speed: exp(-(t-tc)^2 / 2 sigma^2)
+    # relation: sigma = tau / 2.3548
+    sigma = tau / 2.3548
 
-    # 3. Construct Instantaneous Hamiltonian
-    # H(t) = B*J^2 - 1/4 * DeltaAlpha * E(t)^2 * cos^2(theta)
-    h_total = H_ROT - 0.25 * DELTA_ALPHA * field_intensity * COUPLING_MAT
+    if abs(t - t_center) < 4*sigma: # Optimization: Field is zero outside pulse
+        field_sq = (E0 * np.exp(-((t - t_center)**2) / (2 * sigma**2)))**2
+    else:
+        field_sq = 0.0
 
-    # 4. Schrödinger Equation
-    # dPsi/dt = -i * H * Psi
-    d_psi_dt = -1j / HBAR * h_total.dot(psi)
+    # Hamiltonian
+    h_total = H_ROT - 0.25 * DELTA_ALPHA_AU * field_sq * COUPLING_MAT
 
-    # 5. Repack State (Complex -> Real)
-    return np.concatenate([d_psi_dt.real, d_psi_dt.imag])
+    # Derivative
+    dpsi = -1j * h_total.dot(psi)
+    return np.concatenate([dpsi.real, dpsi.imag])
 
-def run_experiment(amp, width, t_total=TIME_MAX, dt_steps=STEPS):
+def run_experiment(intensity_tw, fwhm_fs, t_max_ps=2.0):
     """
-    Simulates the laser-molecule interaction.
-    Input: Laser Amplitude (a.u.), Pulse Width (a.u.)
-    Output: Time grid, Alignment Trace <cos^2>, Final Population Distribution
+    Runs the simulation.
+    Inputs: Intensity (TW/cm2), FWHM (fs)
     """
-    t_grid = np.linspace(0, t_total, dt_steps)
-    t_center = t_total / 2.0 # Center pulse in simulation window
+    # Convert Inputs to Atomic Units
+    intensity_au = intensity_tw / AU_TO_TW_CM2
+    E0_au = np.sqrt(intensity_au) # Field Amplitude
+    tau_au = fwhm_fs / AU_TO_FS
+    t_max_au = t_max_ps / AU_TO_PS
 
-    # Initial State: Ground State |J=0>
-    psi_0 = np.zeros(len(J_VALUES), dtype=complex)
-    psi_0[0] = 1.0 + 0j
-    y0 = np.concatenate([psi_0.real, psi_0.imag])
+    # Time Grid
+    steps = 2000 # High res for pulse
+    t_grid = np.linspace(0, t_max_au, steps)
+    t_center = tau_au * 3.0 # Start pulse early
 
-    # Propagate Dynamics
-    solution = odeint(tdse_derivative, y0, t_grid, args=(amp, width, t_center))
+    # Initial State (Cold N2, J=0)
+    psi0 = np.zeros(len(J_VALS), dtype=complex)
+    psi0[0] = 1.0
+    y0 = np.concatenate([psi0.real, psi0.imag])
 
-    # --- Post-Processing ---
-    alignment_trace = []
-    
-    # Calculate expectation value <cos^2 theta> at each time step
-    for step_state in solution:
-        n = len(step_state) // 2
-        psi_t = step_state[:n] + 1j * step_state[n:]
-        
-        # <Psi| Operator |Psi>
-        exp_val = np.vdot(psi_t, COUPLING_MAT.dot(psi_t))
-        alignment_trace.append(exp_val.real)
+    # Propagate
+    sol = odeint(tdse_derivative, y0, t_grid, args=(E0_au, tau_au, t_center))
 
-    # Final State Populations |c_J|^2
-    final_state_flat = solution[-1]
-    n = len(final_state_flat) // 2
-    psi_final = final_state_flat[:n] + 1j * final_state_flat[n:]
-    populations = np.abs(psi_final)**2
+    # Calculate Alignment Trace
+    trace = []
+    for row in sol:
+        n = len(row) // 2
+        psi = row[:n] + 1j * row[n:]
+        # <cos^2>
+        val = np.vdot(psi, COUPLING_MAT.dot(psi)).real
+        trace.append(val)
 
-    return t_grid, np.array(alignment_trace), populations
+    # Final Populations
+    final = sol[-1]
+    psi_f = final[:n] + 1j * final[n:]
+    pops = np.abs(psi_f)**2
+
+    return t_grid * AU_TO_PS, np.array(trace), pops
 
 # ==============================================================================
-# SECTION 3: THE OPTIMIZATION ENGINE (GENETIC ALGORITHM)
+# 3. GENETIC ALGORITHM (OPTIMIZING REAL PARAMETERS)
 # ==============================================================================
 
-def fitness_function(params):
-    """
-    Cost Function: Maximizes Total Rotational Energy.
-    Energy = Sum( P_J * E_J )
-    """
-    amp, width = params
-    
-    # Physical Constraints (prevent negative widths or unphysical amplitudes)
-    if width <= 0.05 or amp < 0:
-        return 0.0
+def fitness(params):
+    # Params: [Intensity (TW), Duration (fs)]
+    inten, dur = params
 
-    # Run Simulation (Only need final populations)
-    _, _, final_pops = run_experiment(amp, width)
-    
-    # Calculate Fitness (Rotational Energy)
-    rotational_energy = np.sum(final_pops * ROT_ENERGIES)
-    return rotational_energy
+    # Constraints
+    if inten > 100 or inten < 0: return 0 # Max 100 TW/cm2
+    if dur < 10 or dur > 500: return 0    # 10fs to 500fs range
 
-def genetic_optimizer(generations=15, pop_size=20):
-    """
-    Evolutionary Strategy to find optimal pulse parameters.
-    Gene: [Amplitude, Width]
-    """
-    print(f"\n--- INITIALIZING GENETIC ALGORITHM ---")
-    print(f"Target: Maximize Rotational Energy Transfer")
-    
-    # 1. Initialize Population (Random Guess)
-    # Amplitude [0, 25], Width [0.1, 2.0]
+    # Run short sim (just enough to pass the pulse)
+    _, _, pops = run_experiment(inten, dur, t_max_ps=0.5)
+
+    # Fitness = Total Rotational Energy
+    # Sum( P_J * E_J )
+    energy = np.sum(pops * E_LEVELS)
+    return energy * 1e4 # Scale up for readability
+
+def run_ga():
+    pop_size = 15
+    generations = 10
+
+    # Gene: [Intensity (0-60 TW), Duration (30-300 fs)]
     population = np.random.rand(pop_size, 2)
-    population[:, 0] *= 25.0 
-    population[:, 1] = population[:, 1] * 1.9 + 0.1
-    
-    fitness_history = []
-    best_gene_global = None
-    best_fit_global = -1.0
+    population[:, 0] = population[:, 0] * 60.0
+    population[:, 1] = population[:, 1] * 270.0 + 30.0
 
+    history = []
+    best_gene = None
+
+    print("\n--- EVOLVING PULSE SHAPES ---")
     for gen in range(generations):
-        # 2. Evaluate Fitness
-        scores = np.array([fitness_function(ind) for ind in population])
-        
-        # 3. Elitism (Find Best)
+        scores = np.array([fitness(ind) for ind in population])
         best_idx = np.argmax(scores)
-        current_best_gene = population[best_idx]
-        current_best_fit = scores[best_idx]
-        
-        if current_best_fit > best_fit_global:
-            best_fit_global = current_best_fit
-            best_gene_global = current_best_gene
-            
-        fitness_history.append(best_fit_global)
-        
-        # 4. Reproduction & Mutation
-        new_pop = np.zeros_like(population)
-        new_pop[0] = best_gene_global # Keep the king
-        
-        # Adaptive Mutation: Decays as generations progress
-        noise_scale = 1.0 * (1 - gen / generations)
-        
-        # Generate offspring from best gene + Gaussian noise
-        amp_noise = np.random.normal(0, 2.0 * noise_scale, pop_size - 1)
-        width_noise = np.random.normal(0, 0.2 * noise_scale, pop_size - 1)
-        
-        new_pop[1:, 0] = best_gene_global[0] + amp_noise
-        new_pop[1:, 1] = best_gene_global[1] + width_noise
-        
-        # Clip to physical boundaries
-        new_pop[:, 1] = np.clip(new_pop[:, 1], 0.05, 3.0)
-        new_pop[:, 0] = np.abs(new_pop[:, 0])
-        
-        population = new_pop
-        
-        print(f"Gen {gen+1:02d} | Best Energy: {current_best_fit:.4f} a.u. | "
-              f"Pulse: Amp={current_best_gene[0]:.2f}, Width={current_best_gene[1]:.2f}")
+        best_gene = population[best_idx]
+        history.append(scores[best_idx])
 
-    return best_gene_global, fitness_history
+        print(f"Gen {gen+1}: Fit={scores[best_idx]:.2f} | I={best_gene[0]:.1f} TW/cm2, t={best_gene[1]:.1f} fs")
+
+        # Elitism + Mutation
+        new_pop = np.zeros_like(population)
+        new_pop[0] = best_gene
+
+        noise_scale = 1.0 * (1 - gen/generations)
+        noise_I = np.random.normal(0, 5.0 * noise_scale, pop_size-1)
+        noise_t = np.random.normal(0, 10.0 * noise_scale, pop_size-1)
+
+        new_pop[1:, 0] = np.abs(best_gene[0] + noise_I)
+        new_pop[1:, 1] = np.abs(best_gene[1] + noise_t)
+        population = new_pop
+
+    return best_gene, history
 
 # ==============================================================================
-# SECTION 4: MAIN EXECUTION & VISUALIZATION
+# 4. EXECUTION AND PLOTTING
 # ==============================================================================
 
 if __name__ == "__main__":
-    
-    # --- A. RUN OPTIMIZATION ---
-    optimal_params, fit_hist = genetic_optimizer()
-    opt_amp, opt_width = optimal_params
-    
-    print(f"\nOptimization Complete.")
-    print(f"Optimal Parameters >> Amplitude: {opt_amp:.3f} | Width: {opt_width:.3f}")
+    # 1. Run Optimization
+    opt_params, learn_curve = run_ga()
 
-    # --- B. RUN VALIDATION EXPERIMENTS ---
-    
-    # 1. Baseline (Manual Guess - Moderate pulse)
-    base_amp, base_width = 5.0, 0.5
-    t_base, align_base, pop_base = run_experiment(base_amp, base_width)
-    
-    # 2. Optimized (AI Discovered - Super-Rotor)
-    t_opt, align_opt, pop_opt = run_experiment(opt_amp, opt_width)
+    # 2. Run High-Res Simulations for Plots (Longer time for revivals)
+    # Baseline: 10 TW/cm2, 200 fs (Standard alignment pulse)
+    t_base, align_base, pop_base = run_experiment(10.0, 200.0, t_max_ps=10.0)
 
-    # --- C. PLOTTING RESULTS ---
-    fig = plt.figure(figsize=(14, 8))
-    
-    # Subplot 1: Learning Curve
-    ax1 = fig.add_subplot(2, 2, 1)
-    ax1.plot(fit_hist, 'o-', color='green', lw=2)
-    ax1.set_title("Genetic Algorithm Convergence")
-    ax1.set_ylabel("Fitness (Rotational Energy)")
-    ax1.set_xlabel("Generation")
-    ax1.grid(True, alpha=0.3)
+    # Optimized: Result from GA
+    t_opt, align_opt, pop_opt = run_experiment(opt_params[0], opt_params[1], t_max_ps=10.0)
 
-    # Subplot 2: Alignment Dynamics <cos^2 theta>
-    ax2 = fig.add_subplot(2, 2, 2)
-    ax2.plot(t_base, align_base, 'r--', label=f'Baseline (A={base_amp}, W={base_width})', alpha=0.7)
-    ax2.plot(t_opt, align_opt, 'b-', label=f'Optimized (A={opt_amp:.1f}, W={opt_width:.1f})', lw=2)
-    ax2.axhline(1/3, color='black', linestyle=':', label='Isotropic limit')
-    ax2.set_title("Field-Free Molecular Alignment")
-    ax2.set_ylabel(r"Alignment $\langle \cos^2 \theta \rangle$")
-    ax2.set_xlabel("Time (a.u.)")
-    ax2.legend()
-    ax2.grid(True, alpha=0.3)
+    # --- SAVE PLOTS FOR LATEX ---
 
-    # Subplot 3: Final Population Distribution (The "Super-Rotor" Signature)
-    ax3 = fig.add_subplot(2, 1, 2)
-    bar_width = 0.8
-    ax3.bar(J_VALUES - bar_width/4, pop_base, width=bar_width/2, color='salmon', label='Baseline Population')
-    ax3.bar(J_VALUES + bar_width/4, pop_opt, width=bar_width/2, color='navy', label='Optimized Population')
-    ax3.set_title("Rotational State Distribution (Wavepacket Composition)")
-    ax3.set_xlabel("Rotational Quantum Number J")
-    ax3.set_ylabel("Population Probability")
-    ax3.set_xticks(J_VALUES)
-    ax3.legend()
-    ax3.grid(True, axis='y', alpha=0.3)
-
+    # Fig 1: Baseline Trace
+    plt.figure(figsize=(6, 4))
+    plt.plot(t_base, align_base, 'r', label='Baseline')
+    plt.xlabel('Time (ps)')
+    plt.ylabel(r'$\langle \cos^2 \theta \rangle$')
+    plt.title('Baseline Alignment (10 TW, 200 fs)')
+    plt.grid(True, alpha=0.3)
     plt.tight_layout()
-    plt.show()
+    plt.savefig('fig1_baseline_trace.png', dpi=300)
+
+    # Fig 2: Baseline Pop
+    plt.figure(figsize=(6, 4))
+    plt.bar(J_VALS, pop_base, color='red', alpha=0.7)
+    plt.xlabel('J State')
+    plt.ylabel('Population')
+    plt.title('Baseline Populations')
+    plt.tight_layout()
+    plt.savefig('fig2_baseline_pop.png', dpi=300)
+
+    # Fig 3: Learning Curve
+    plt.figure(figsize=(6, 4))
+    plt.plot(range(1, len(learn_curve)+1), learn_curve, 'g-o')
+    plt.xlabel('Generation')
+    plt.ylabel('Rotational Energy Score')
+    plt.title('Evolutionary Learning')
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig('fig3_learning.png', dpi=300)
+
+    # Fig 4: Results Comparison
+    plt.figure(figsize=(10, 5))
+    plt.subplot(1, 2, 1)
+    plt.plot(t_opt, align_opt, 'b', label='Optimized')
+    plt.plot(t_base, align_base, 'r--', alpha=0.5, label='Baseline')
+    plt.xlabel('Time (ps)')
+    plt.legend()
+    plt.title('Revival Dynamics')
+
+    plt.subplot(1, 2, 2)
+    plt.bar(J_VALS+0.5, pop_opt, width=1.8, color='blue', label='Optimized')
+    plt.bar(J_VALS-0.5, pop_base, width=1.8, color='red', alpha=0.5, label='Baseline')
+    plt.xlabel('J State')
+    plt.legend()
+    plt.title('Super-Rotor Distribution')
+    plt.tight_layout()
+    plt.savefig('fig4_results.png', dpi=300)
+
+    print("All images generated.")
