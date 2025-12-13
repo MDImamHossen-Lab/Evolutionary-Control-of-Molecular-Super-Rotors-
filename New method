@@ -1,0 +1,573 @@
+import numpy as np
+
+import scipy.sparse as sp
+
+from scipy.integrate import solve_ivp
+
+import matplotlib.pyplot as plt
+
+import time
+
+# =============================================================================
+
+# 1. PHYSICAL CONSTANTS & CONVERSIONS (Atomic Units)
+
+# =============================================================================
+
+AU_TO_FS = 0.0241888
+
+CM1_TO_AU = 4.5563e-6
+
+# Molecule: Nitrogen (N2)
+
+MOLECULE_B = 1.99 * CM1_TO_AU
+
+DELTA_ALPHA = 7.0 
+
+# --- OPTIMIZATION SETTINGS ---
+
+# Lowered J_MAX slightly to ensure Colab execution finishes quickly.
+
+# Real research uses J=50+, Demo uses J=12
+
+J_MAX_BASIS = 12  
+
+TOTAL_STATES = (J_MAX_BASIS + 1)**2
+
+print(f"Simulation Configuration: J_max={J_MAX_BASIS} ({TOTAL_STATES} quantum states)")
+
+# =============================================================================
+
+# 2. HELPER FUNCTIONS
+
+# =============================================================================
+
+def get_basis_index(J, M):
+
+    """Maps (J, M) quantum numbers to a linear index."""
+
+    return J**2 + J + M
+
+def coupling_cos2_theta(J, M, Jp, Mp):
+
+    """Calculates <J M | cos^2 theta | J' M'>."""
+
+    if M != Mp: return 0.0
+
+    if J == Jp:
+
+        return (1.0/3.0) + (2.0/3.0) * (J*(J+1) - 3*M**2) / ((2*J+3)*(2*J-1))
+
+    elif Jp == J + 2:
+
+        num = np.sqrt(((J+1)**2 - M**2) * ((J+2)**2 - M**2))
+
+        den = (2*J+3) * np.sqrt((2*J+1)*(2*J+5))
+
+        return num / den
+
+    elif Jp == J - 2:
+
+        return coupling_cos2_theta(Jp, M, J, M)
+
+    return 0.0
+
+def coupling_sin2_e2iphi(J, M, Jp, Mp):
+
+    """Approximation for coupling <J M | sin^2 theta * e^{2 i chi} | J' M+2>."""
+
+    # Simplified scaling factor for demo speed
+
+    if J == Jp:
+
+        return 0.1 * np.sqrt((J-M)*(J-M-1)*(J+M+1)*(J+M+2)) / (J*(J+1))
+
+    elif Jp == J + 2:
+
+        return 0.1 * np.sqrt((J+M+1)*(J+M+2)*(J+M+3)*(J+M+4)) / ((2*J+1)**2)
+
+    elif Jp == J - 2:
+
+        return 0.1 * np.sqrt((J-M)*(J-M-1)*(J-M-2)*(J-M-3)) / ((2*J+1)**2)
+
+    return 0.0
+
+# =============================================================================
+
+# 3. FAST HAMILTONIAN BUILDER
+
+# =============================================================================
+
+def build_operators():
+
+    """Constructs sparse matrices. Runs ONCE at startup."""
+
+    rows_J2, cols_J2, data_J2 = [], [], []
+
+    rows_Jz, cols_Jz, data_Jz = [], [], []
+
+    rows_A, cols_A, data_A = [], [], [] # V_diagM
+
+    rows_B, cols_B, data_B = [], [], [] # V_offM
+
+    for J in range(J_MAX_BASIS + 1):
+
+        for M in range(-J, J + 1):
+
+            idx = get_basis_index(J, M)
+
+            
+
+            # Kinetic & Coriolis
+
+            rows_J2.append(idx); cols_J2.append(idx); data_J2.append(J*(J+1))
+
+            rows_Jz.append(idx); cols_Jz.append(idx); data_Jz.append(M)
+
+            
+
+            # Potential Coupling
+
+            for J_prime in [J-2, J, J+2]:
+
+                if J_prime < 0 or J_prime > J_MAX_BASIS: continue
+
+                
+
+                # Diagonal in M
+
+                elem_cos2 = coupling_cos2_theta(J, M, J_prime, M)
+
+                elem_sin2 = (1.0 - elem_cos2) if J == J_prime else -elem_cos2
+
+                if abs(elem_sin2) > 1e-10:
+
+                    rows_A.append(idx); cols_A.append(get_basis_index(J_prime, M)); data_A.append(elem_sin2)
+
+                # Off-diagonal in M (+/- 2)
+
+                for dM in [-2, 2]:
+
+                    Mp = M + dM
+
+                    if abs(Mp) <= J_prime:
+
+                        val = coupling_sin2_e2iphi(J, M, J_prime, Mp)
+
+                        if abs(val) > 1e-10:
+
+                            rows_B.append(idx); cols_B.append(get_basis_index(J_prime, Mp)); data_B.append(val * 0.5)
+
+    # Create CSR matrices (efficient for math)
+
+    H_rot = sp.csr_matrix((data_J2, (rows_J2, cols_J2)), shape=(TOTAL_STATES, TOTAL_STATES))
+
+    H_cor = sp.csr_matrix((data_Jz, (rows_Jz, cols_Jz)), shape=(TOTAL_STATES, TOTAL_STATES))
+
+    V_diagM = sp.csr_matrix((data_A, (rows_A, cols_A)), shape=(TOTAL_STATES, TOTAL_STATES))
+
+    V_offM = sp.csr_matrix((data_B, (rows_B, cols_B)), shape=(TOTAL_STATES, TOTAL_STATES))
+
+    return H_rot, H_cor, V_diagM, V_offM
+
+# =============================================================================
+
+# 4. SIMULATION ENGINE
+
+# =============================================================================
+
+class CentrifugeSimulation:
+
+    def __init__(self):
+
+        print("Building Hamiltonian Operators... ", end="")
+
+        self.H_rot, self.H_cor, self.V_diagM, self.V_offM = build_operators()
+
+        # Pre-calculate combined static potential part to save time in loop
+
+        self.V_static = self.V_diagM + self.V_offM
+
+        print("Done.")
+
+        self.states = TOTAL_STATES
+
+    
+
+    def run(self, params):
+
+        I0, beta, tau = params
+
+        
+
+        # Initial State: |0,0>
+
+        psi0 = np.zeros(self.states, dtype=complex)
+
+        psi0[get_basis_index(0, 0)] = 1.0 + 0.0j
+
+        
+
+        # Reduced time span for demo speed (2.5x pulse width)
+
+        t_span = (0, tau * 2.5)
+
+        # Reduced snapshots for memory efficiency
+
+        t_eval = np.linspace(t_span[0], t_span[1], 50) 
+
+        
+
+        # Local variable binding for speed inside ODE
+
+        H_rot = self.H_rot
+
+        H_cor = self.H_cor
+
+        V_static = self.V_static
+
+        B_const = MOLECULE_B
+
+        neg_i = -1j
+
+        
+
+        # Pulse center
+
+        t_c = tau * 1.25
+
+        tau_sq = tau**2
+
+        factor_gauss = -4 * np.log(2)
+
+        
+
+        def tdse(t, psi):
+
+            # 1. Calculate Field
+
+            # Gaussian Envelope
+
+            env = np.exp(factor_gauss * ((t - t_c)**2) / tau_sq)
+
+            E0 = np.sqrt(I0) * env
+
+            Omega = beta * t 
+
+            
+
+            # 2. Build H(t)
+
+            # H = B*J^2 - Omega*J_z - 0.25 * E0^2 * DeltaAlpha * V_static
+
+            
+
+            # Calculate the scalar prefactor for the potential
+
+            pot_factor = -0.25 * (E0**2) * DELTA_ALPHA
+
+            
+
+            # Sum matrices (CSR addition is relatively fast)
+
+            # Optimization: H_rot is constant, H_cor scales with Omega, V scales with Field
+
+            H_t = B_const * H_rot - Omega * H_cor + pot_factor * V_static
+
+            
+
+            return neg_i * H_t.dot(psi)
+
+        # Use RK23 (Lower order, faster) and relaxed tolerance (1e-3)
+
+        sol = solve_ivp(tdse, t_span, psi0, t_eval=t_eval, method='RK23', rtol=1e-3, atol=1e-5)
+
+        return sol.t, sol.y
+
+    def get_J2(self, psi):
+
+        # Calculate <J^2>
+
+        prob = np.abs(psi)**2
+
+        exp_J2 = 0.0
+
+        # This loop is fast for small J_MAX
+
+        for J in range(J_MAX_BASIS + 1):
+
+            start = get_basis_index(J, -J)
+
+            end = get_basis_index(J, J) + 1
+
+            p_J = np.sum(prob[start:end])
+
+            exp_J2 += J*(J+1) * p_J
+
+        return exp_J2
+
+# =============================================================================
+
+# 5. GENETIC ALGORITHM
+
+# =============================================================================
+
+class GeneticOptimizer:
+
+    def __init__(self, simulator):
+
+        self.sim = simulator
+
+        self.pop_size = 5     # Reduced for Speed
+
+        self.generations = 3  # Reduced for Speed
+
+        self.population = []
+
+        self.history = []
+
+        self.bounds = [
+
+            (0.0001, 0.005), # Intensity
+
+            (1e-6, 5e-5),    # Chirp Rate
+
+            (2000, 8000)     # Duration (fs approx)
+
+        ]
+
+    def init_pop(self):
+
+        self.population = []
+
+        for _ in range(self.pop_size):
+
+            p = [np.random.uniform(b[0], b[1]) for b in self.bounds]
+
+            self.population.append(p)
+
+    def evolve(self):
+
+        print(f"\n--- Starting Evolution ({self.generations} Gens, {self.pop_size} Pop) ---")
+
+        best_overall_p = None
+
+        best_overall_s = -np.inf
+
+        
+
+        for g in range(self.generations):
+
+            scores = []
+
+            j2s = []
+
+            
+
+            # Evaluate Population
+
+            for i, ind in enumerate(self.population):
+
+                # Run Simulation
+
+                t, y = self.sim.run(ind)
+
+                final_J2 = self.sim.get_J2(y[:, -1])
+
+                
+
+                # Fitness: Max J^2, tiny penalty for energy
+
+                fitness = final_J2 - (ind[0]*ind[2]*1e-5)
+
+                
+
+                scores.append(fitness)
+
+                j2s.append(final_J2)
+
+                
+
+                if fitness > best_overall_s:
+
+                    best_overall_s = fitness
+
+                    best_overall_p = ind
+
+            # Stats
+
+            avg_fit = np.mean(scores)
+
+            max_fit = np.max(scores)
+
+            max_j2 = np.max(j2s)
+
+            self.history.append(max_fit)
+
+            
+
+            print(f"Gen {g+1}/{self.generations} | Best J^2: {max_j2:.2f} | Avg Fit: {avg_fit:.2f}")
+
+            # Elitism & Selection
+
+            sorted_indices = np.argsort(scores)[::-1] # High to low
+
+            new_pop = [self.population[sorted_indices[0]]] # Keep best
+
+            
+
+            # Simple Breeding
+
+            while len(new_pop) < self.pop_size:
+
+                # Pick 2 random parents from top 50%
+
+                top_half = sorted_indices[:max(2, self.pop_size//2)]
+
+                p1 = self.population[np.random.choice(top_half)]
+
+                p2 = self.population[np.random.choice(top_half)]
+
+                
+
+                # Crossover
+
+                child = [p1[0], p2[1], p1[2]] if np.random.random() > 0.5 else [p2[0], p1[1], p2[2]]
+
+                
+
+                # Mutation
+
+                if np.random.random() < 0.3:
+
+                    m = np.random.randint(0,3)
+
+                    child[m] *= np.random.uniform(0.8, 1.2)
+
+                    child[m] = np.clip(child[m], self.bounds[m][0], self.bounds[m][1])
+
+                
+
+                new_pop.append(child)
+
+            self.population = new_pop
+
+            
+
+        return best_overall_p
+
+# =============================================================================
+
+# 6. MAIN
+
+# =============================================================================
+
+def main():
+
+    sim = CentrifugeSimulation()
+
+    opt = GeneticOptimizer(sim)
+
+    opt.init_pop()
+
+    
+
+    start = time.time()
+
+    best_params = opt.evolve()
+
+    end = time.time()
+
+    
+
+    print(f"\nOptimization Finished in {end-start:.1f} seconds.")
+
+    
+
+    # Run Best Result for Plotting
+
+    print("Simulating best result for visualization...")
+
+    I_opt, b_opt, t_opt = best_params
+
+    t_arr, psi_arr = sim.run(best_params)
+
+    
+
+    J2_vals = [sim.get_J2(psi_arr[:, i]) for i in range(len(t_arr))]
+
+    
+
+    # Final Population
+
+    psi_final = psi_arr[:, -1]
+
+    prob = np.abs(psi_final)**2
+
+    pops = []
+
+    for J in range(J_MAX_BASIS+1):
+
+        s = get_basis_index(J, -J)
+
+        e = get_basis_index(J, J) + 1
+
+        pops.append(np.sum(prob[s:e]))
+
+    # Plotting
+
+    fig, axs = plt.subplots(1, 3, figsize=(18, 5))
+
+    
+
+    # 1. J^2 vs Time
+
+    axs[0].plot(t_arr*AU_TO_FS, J2_vals, 'r-', lw=2)
+
+    axs[0].set_title("Rotational Spin-Up")
+
+    axs[0].set_xlabel("Time (fs)")
+
+    axs[0].set_ylabel("<J^2>")
+
+    axs[0].grid(True, alpha=0.3)
+
+    
+
+    # 2. Final Populations
+
+    axs[1].bar(range(len(pops)), pops, color='teal')
+
+    axs[1].set_title(f"Final J Distribution (J_max={J_MAX_BASIS})")
+
+    axs[1].set_xlabel("Rotational Quantum Number J")
+
+    axs[1].set_ylabel("Population")
+
+    
+
+    # 3. GA Progress
+
+    axs[2].plot(opt.history, 'o-')
+
+    axs[2].set_title("Genetic Algorithm Convergence")
+
+    axs[2].set_xlabel("Generation")
+
+    axs[2].set_ylabel("Best Fitness")
+
+    axs[2].grid(True)
+
+    
+
+    plt.tight_layout()
+
+    plt.show()
+
+    
+
+    print(f"Optimal Result: Intensity={I_opt:.4f}, Chirp={b_opt:.2e}, Duration={t_opt:.1f}")
+
+if __name__ == "__main__":
+
+    main()
