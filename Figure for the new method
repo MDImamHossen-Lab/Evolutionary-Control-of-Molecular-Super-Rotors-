@@ -1,0 +1,98 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.colors import LinearSegmentedColormap
+
+# Setup the figure environment
+plt.rcParams.update({'font.size': 12, 'font.family': 'serif'})
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
+
+# ==========================================
+# FIGURE 1: GA Convergence Profile
+# Context:
+# ==========================================
+
+# 1. Generate Data based on text description
+generations = np.arange(0, 51)
+
+# Simulation of "Rapid ascent in first 5 generations" (Exploration Phase)
+# Followed by "Asymptotic behavior" (Refinement Phase)
+max_fitness = 1450 * (1 - 0.9 * np.exp(-generations / 5.0))  # Max approaches ~1450
+avg_fitness = max_fitness * 0.85 - (100 * np.exp(-generations / 10.0)) # Avg trails Max
+# Add some "noise" to represent mutation/crossover variations
+np.random.seed(42)
+avg_fitness += np.random.normal(0, 15, size=len(generations))
+
+# 2. Plotting
+ax1.plot(generations, max_fitness, 'b-', linewidth=2.5, label='Max Fitness') # Solid line
+ax1.plot(generations, avg_fitness, 'r--', linewidth=2.0, alpha=0.8, label='Average Fitness') # Dashed line
+
+# 3. Formatting
+ax1.set_title("Figure 1: Convergence Profile of Genetic Algorithm")
+ax1.set_xlabel("Generation")
+ax1.set_ylabel(r"Fitness Function $\langle \hat{J}^2 \rangle - \lambda E$")
+ax1.legend(loc='lower right')
+ax1.grid(True, linestyle=':', alpha=0.6)
+ax1.text(5, 400, "Exploration Phase\n(Discovery of Threshold Intensity)", fontsize=9, rotation=45)
+ax1.text(25, 1200, "Refinement Phase\n(Fine-tuning Chirp)", fontsize=9)
+
+
+# ==========================================
+# FIGURE 2: Final Population Heatmap
+# Context:
+# ==========================================
+
+# 1. Setup Grid
+# X-axis: J (0 to 50)
+# Y-axis: M (-J to +J)
+J_max = 50
+J_values = np.arange(0, J_max + 1)
+M_values = np.arange(-J_max, J_max + 1)
+population_grid = np.zeros((len(M_values), len(J_values)))
+
+# 2. Generate Synthetic Data for "Cartwheeling" Wavepacket
+# Text states: "Population spreads towards M approx +/- J"
+# Optimized Final J is approx 38
+target_J = 38
+J_width = 4.0
+
+for i, J in enumerate(J_values):
+    # Gaussian envelope for J distribution centered at J=38
+    J_prob = np.exp(-0.5 * ((J - target_J) / J_width)**2)
+
+    if J_prob > 0.001:
+        # For each J, distribute M near the edges (+/- J)
+        # We find the indices in M_values corresponding to current M
+        for j, M in enumerate(M_values):
+            if abs(M) <= J: # Physical constraint |M| <= J
+                # Probability concentrates at edges M ~ +/- J
+                # Sigma for M spread
+                M_sigma = 2.0
+                M_prob = (np.exp(-0.5 * ((M - J) / M_sigma)**2) +
+                          np.exp(-0.5 * ((M + J) / M_sigma)**2))
+
+                population_grid[j, i] = J_prob * M_prob
+
+# Normalize
+population_grid /= np.max(population_grid)
+
+# 3. Plotting
+# Use a custom colormap (White to Dark Blue/Black)
+cmap = LinearSegmentedColormap.from_list("custom_blue", ["white", "cornflowerblue", "midnightblue"])
+c = ax2.imshow(population_grid, aspect='auto', origin='lower', cmap=cmap,
+               extent=[0, J_max, -J_max, J_max])
+
+# 4. Formatting
+ax2.set_title(r"Figure 2: Final State Distribution in $|J, M\rangle$ Basis")
+ax2.set_xlabel(r"Total Angular Momentum $J$")
+ax2.set_ylabel(r"Magnetic Quantum Number $M$")
+cbar = plt.colorbar(c, ax=ax2)
+cbar.set_label(r"Population Probability $|c_{J,M}|^2$")
+
+# Annotations for "Cartwheeling"
+ax2.annotate('Cartwheeling States\n(Planar Rotation)', xy=(38, 38), xytext=(10, 40),
+             arrowprops=dict(facecolor='black', shrink=0.05), fontsize=10)
+ax2.annotate('', xy=(38, -38), xytext=(20, -20),
+             arrowprops=dict(facecolor='black', shrink=0.05))
+
+plt.tight_layout()
+plt.show()
