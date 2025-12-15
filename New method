@@ -9,13 +9,12 @@ import time
 # 1. CONFIGURATION & PHYSICAL CONSTANTS
 # ==========================================
 # Units: Atomic Units (Hartree)
-# [span_0](start_span)Parameters for N2 from Table 1[span_0](end_span)
 B0 = 9.07e-6          # Rotational Constant (~1.99 cm^-1)
 DELTA_ALPHA = 7.0     # Polarizability Anisotropy (~1.0 A^3)
-[span_1](start_span)J_MAX = 50            # Basis size (Matches "Final" in Table 1)[span_1](end_span)
-[span_2](start_span)LAMBDA_REG = 1e-4     # Regularization weight[span_2](end_span)
+J_MAX = 50             # Basis size
+LAMBDA_REG = 1e-4     # Regularization weight
 
-# [span_3](start_span)GA Parameters (Matches Section 5.1)[span_3](end_span)
+# GA Parameters
 POP_SIZE = 20
 GENERATIONS = 50
 MUTATION_RATE = 0.2
@@ -28,9 +27,9 @@ class OpticalCentrifuge:
         self.j_max = j_max
         self.states = []
         self.idx_map = {}
-        
+
         # Build Basis |J, M>
-        # [span_4](start_span)Linear indexing k = J^2 + J + M[span_4](end_span)
+        # Linear indexing k = J^2 + J + M
         cnt = 0
         for j in range(self.j_max + 1):
             for m in range(-j, j + 1):
@@ -39,104 +38,102 @@ class OpticalCentrifuge:
                 cnt += 1
         self.dim = cnt
         print(f"System Initialized: N2 Rotor with J_max={j_max} ({self.dim} states)")
-        
+
         self._build_operators()
 
     def _get_idx(self, j, m):
         return self.idx_map.get((j, m), None)
 
     def _build_operators(self):
-        """Constructs sparse Hamiltonian matrices based on Section 3.1"""
+        """Constructs sparse Hamiltonian matrices"""
         print("Constructing sparse Hamiltonian matrices...")
-        
-        # 1. [span_5](start_span)Kinetic Energy: B*J*(J+1)[span_5](end_span)
-        # 2. [span_6](start_span)Coriolis Term: -M (diagonal part, Omega(t) added later)[span_6](end_span)
+
+        # 1. Kinetic Energy: B*J*(J+1)
+        # 2. Coriolis Term: -M (diagonal part, Omega(t) added later)
         diag_kin = []
         diag_cor = []
         for (j, m) in self.states:
             diag_kin.append(B0 * j * (j + 1))
             diag_cor.append(-1.0 * m)
-            
+
         self.H_kin = diags(diag_kin, format='csr', dtype=complex)
         self.H_cor_base = diags(diag_cor, format='csr', dtype=complex)
 
         # 3. Interaction Potential V_int
         # V ~ -E^2 [ (1/2)*sin^2(theta) + (1/4)*sin^2(theta)*(e^2ix + e^-2ix) ]
-        # We need matrix elements for sin^2(theta) = 1 - cos^2(theta)
-        
-        # [span_7](start_span)A. Cos^2(Theta) Matrix (Couples J, J+/-2)[span_7](end_span)
+
+        # A. Cos^2(Theta) Matrix (Couples J, J+/-2)
         V_cos2 = lil_matrix((self.dim, self.dim), dtype=complex)
-        
+
         for idx, (j, m) in enumerate(self.states):
-            # Diagonal J (Eq 3.4 in paper)
+            # Diagonal J
             val_diag = (1/3) + (2/3) * (j*(j+1) - 3*m**2) / ((2*j+3)*(2*j-1)) if j>0 else 1/3
             V_cos2[idx, idx] = val_diag
-            
+
             # Off-diagonal J (J <-> J+2)
             if j + 2 <= self.j_max:
                 idx_up = self._get_idx(j+2, m)
                 # Standard rigid rotor coupling approximation
-                coupling = 0.5 * np.sqrt((j+1)**2 - m**2)/((2*j+1)*np.sqrt((2*j+1)*(2*j+3))) # simplified scaling
+                coupling = 0.5 * np.sqrt((j+1)**2 - m**2)/((2*j+1)*np.sqrt((2*j+1)*(2*j+3)))
                 if idx_up:
                     V_cos2[idx, idx_up] = coupling
                     V_cos2[idx_up, idx] = coupling
-                    
+
         V_cos2 = V_cos2.tocsr()
         self.V_iso = diags([1.0]*self.dim, format='csr') - V_cos2 # sin^2 = 1 - cos^2
-        
-        # [span_8](start_span)B. Anisotropic Mixing (Cartwheeling term e^2ix)[span_8](end_span)
+
+        # B. Anisotropic Mixing (Cartwheeling term e^2ix)
         # Couples M to M +/- 2
         self.V_aniso = lil_matrix((self.dim, self.dim), dtype=complex)
-        
+
         for idx, (j, m) in enumerate(self.states):
             # Coupling M <-> M+2
             if abs(m + 2) <= j:
                 idx_m2 = self._get_idx(j, m+2)
                 if idx_m2:
-                    # Scaling based on geometric overlap (approximate)
-                    # [span_9](start_span)This drives the symmetry breaking[span_9](end_span)
-                    self.V_aniso[idx, idx_m2] = 0.25 
+                    # Scaling based on geometric overlap (drives symmetry breaking)
+                    self.V_aniso[idx, idx_m2] = 0.25
                     self.V_aniso[idx_m2, idx] = 0.25
-        
+
         self.V_aniso = self.V_aniso.tocsr()
 
     def propagate(self, I0, beta, tau):
-        [span_10](start_span)"""Solves TDSE using RK45[span_10](end_span)"""
-        
+        """Solves TDSE using RK45"""
+
         # Initial State |0,0>
         psi0 = np.zeros(self.dim, dtype=complex)
         psi0[0] = 1.0
-        
+
         # Pulse definition
         # Gaussian envelope centered at 1.5*tau
         t_center = 1.5 * tau
         sigma = tau / 2.355 # FWHM to sigma
         t_span = (0, 3.0 * tau)
-        
+
         def equations(t, psi):
             # Fields
             env = np.sqrt(I0) * np.exp(-0.5 * ((t - t_center)/sigma)**2)
-            omega = beta * t  # Linear chirp approximation for simulation step
-            
+            omega = beta * t  # Linear chirp approximation
+
             # Hamiltonian construction
             # H = H_kin - Omega*M - 1/4 * E^2 * DeltaAlpha * (V_iso + V_aniso)
-            
+
             # 1. Kinetic - Coriolis
             H_eff = self.H_kin + self.H_cor_base * omega
-            
+
             # 2. Potential
-            # [span_11](start_span)The 0.5 factor comes from the decomposition in Eq 2.7[span_11](end_span)
-            V_coupling = (self.V_iso * 0.5) + (self.V_aniso * 0.25) 
+            # The 0.5 factor comes from decomposition
+            V_coupling = (self.V_iso * 0.5) + (self.V_aniso * 0.25)
             potential_term = V_coupling * (-0.25 * (env**2) * DELTA_ALPHA)
-            
+
             H_total = H_eff + potential_term
-            
+
             return -1j * H_total.dot(psi)
 
         # Solve ODE
-        sol = solve_ivp(equations, t_span, psi0, method='RK45', 
-                        rtol=1e-4, atol=1e-6) # Tolerances for speed vs accuracy
-        
+        sol = solve_ivp(equations, t_span, psi0, method='RK45',
+                        rtol=1e-4, atol=1e-6)
+
         return sol.y[:, -1], sol.t
 
 # ==========================================
@@ -147,8 +144,8 @@ class GeneticOptimizer:
         self.engine = engine
         self.history_max = []
         self.history_avg = []
-        
-        # [span_12](start_span)Init Population (Random)[span_12](end_span)
+
+        # Init Population (Random)
         self.population = []
         for _ in range(POP_SIZE):
             self.population.append({
@@ -161,49 +158,49 @@ class GeneticOptimizer:
         # Calculate J^2 expectation
         psi_final, _ = self.engine.propagate(params['I0'], params['beta'], params['tau'])
         probs = np.abs(psi_final)**2
-        
+
         j_sq_expect = 0.0
         for idx, (j, m) in enumerate(self.engine.states):
             j_sq_expect += probs[idx] * (j * (j + 1))
-            
-        # [span_13](start_span)Fitness function Eq 3.6[span_13](end_span)
+
+        # Fitness function
         energy = params['I0'] * params['tau']
         return j_sq_expect - LAMBDA_REG * energy, j_sq_expect
 
     def run(self):
         print(f"Starting GA optimization for {GENERATIONS} generations...")
-        
+
         for gen in range(GENERATIONS):
             start_t = time.time()
             fitness_scores = []
-            
+
             # Evaluate
             for ind in self.population:
                 f, j_sq = self.fitness(ind)
                 ind['fitness'] = f
                 ind['j_sq'] = j_sq
                 fitness_scores.append(f)
-            
+
             # Stats
             max_f = max(fitness_scores)
             avg_f = np.mean(fitness_scores)
             self.history_max.append(max_f)
             self.history_avg.append(avg_f)
-            
-            # [span_14](start_span)Sort (Elitism)[span_14](end_span)
+
+            # Sort (Elitism)
             self.population.sort(key=lambda x: x['fitness'], reverse=True)
-            
+
             print(f"Gen {gen}: Max Fit={max_f:.2f} (<J^2>={self.population[0]['j_sq']:.1f}) | Time: {time.time()-start_t:.1f}s")
-            
+
             if gen == GENERATIONS - 1: break
-            
+
             # Selection & Crossover
             new_pop = [self.population[0]] # Keep best
-            
+
             # Roulette Wheel Selection
             probs = np.array([max(0, f) for f in fitness_scores])
             probs /= probs.sum() if probs.sum() > 0 else 1
-            
+
             while len(new_pop) < POP_SIZE:
                 p1, p2 = np.random.choice(self.population, size=2, p=probs)
                 child = {
@@ -211,36 +208,36 @@ class GeneticOptimizer:
                     'beta': p1['beta'] if np.random.rand()>0.5 else p2['beta'],
                     'tau': p1['tau'] if np.random.rand()>0.5 else p2['tau']
                 }
-                # [span_15](start_span)Mutation[span_15](end_span)
+                # Mutation
                 if np.random.rand() < MUTATION_RATE:
                     key = np.random.choice(['I0', 'beta', 'tau'])
                     child[key] *= np.random.uniform(0.9, 1.1)
                 new_pop.append(child)
-            
+
             self.population = new_pop
-            
+
         return self.population[0]
 
 # ==========================================
-# 4. EXECUTION & VISUALIZATION (Figures 1 & 2)
+# 4. EXECUTION & VISUALIZATION
 # ==========================================
 if __name__ == "__main__":
     # A. Setup System
     sim = OpticalCentrifuge(j_max=J_MAX)
     ga = GeneticOptimizer(sim)
-    
-    # B. Run Optimization (Generates Figure 1 Data)
+
+    # B. Run Optimization
     best_pulse = ga.run()
-    
-    # C. Re-run Best Pulse for High-Res Heatmap (Generates Figure 2 Data)
+
+    # C. Re-run Best Pulse for High-Res Heatmap
     print("\nRunning final high-resolution simulation for best pulse...")
     psi_final, _ = sim.propagate(best_pulse['I0'], best_pulse['beta'], best_pulse['tau'])
-    
+
     # --- PLOTTING ---
     plt.rcParams.update({'font.size': 12, 'font.family': 'serif'})
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
-    
-    # Figure 1: Convergence
+
+    # Plot 1: Convergence
     gens = np.arange(len(ga.history_max))
     ax1.plot(gens, ga.history_max, 'b-', label='Max Fitness')
     ax1.plot(gens, ga.history_avg, 'r--', alpha=0.7, label='Avg Fitness')
@@ -249,26 +246,26 @@ if __name__ == "__main__":
     ax1.set_ylabel(r"Fitness $\langle J^2 \rangle - \lambda E$")
     ax1.legend()
     ax1.grid(True, alpha=0.3)
-    
-    # Figure 2: Population Heatmap (Cartwheeling)
+
+    # Plot 2: Population Heatmap (Cartwheeling)
     # Convert state vector to grid
     pop_grid = np.zeros((2*J_MAX+1, J_MAX+1)) # Rows: M (-J to J), Cols: J
     prob_dist = np.abs(psi_final)**2
-    
+
     for idx, (j, m) in enumerate(sim.states):
         # Map M from [-J, J] to array index [0, 2*J_MAX]
-        row_idx = m + J_MAX 
+        row_idx = m + J_MAX
         pop_grid[row_idx, j] = prob_dist[idx]
 
     cmap = LinearSegmentedColormap.from_list("custom_blue", ["white", "cornflowerblue", "midnightblue"])
     c = ax2.imshow(pop_grid, aspect='auto', origin='lower', cmap=cmap,
                    extent=[0, J_MAX, -J_MAX, J_MAX], vmin=0, vmax=np.max(pop_grid)*0.8)
-    
+
     ax2.set_title(r"Figure 2: Final State Distribution in $|J,M\rangle$")
     ax2.set_xlabel("Total Angular Momentum J")
     ax2.set_ylabel("Magnetic Quantum Number M")
     plt.colorbar(c, ax=ax2, label="Population")
-    
+
     print("\nOptimization Finished.")
     print(f"Optimal Parameters: I0={best_pulse['I0']:.2e}, Beta={best_pulse['beta']:.2e}")
     plt.tight_layout()
